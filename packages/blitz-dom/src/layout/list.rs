@@ -64,6 +64,11 @@ fn counter_properties(doc: &BaseDocument, node_id: NodeId) -> Option<CounterProp
             );
         }
         properties.is_list_item = style.get_box().display.is_list_item();
+        if let Some(el) = node.element_data() {
+            if el.name.local == local_name!("ol") || el.name.local == local_name!("li") {
+                eprintln!("DBGUB1 node={} tag={} reset={:?} inc={:?} reversed_attr={}", node_id, &*el.name.local, counters.counter_reset, counters.counter_increment, el.attr(local_name!("reversed")).is_some());
+            }
+        }
     }
 
     // HTML's value attribute sets the item's ordinal independent of CSS
@@ -194,6 +199,7 @@ pub(crate) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
         }
 
         let ordinal = counters.last().map_or(0, |counter| counter.value);
+        if props.is_list_item { eprintln!("DBGUB1 ordinal node={} value={} reset={:?} stack={}", node_id, ordinal, props.reset, counters.len()); }
         let layout = if props.is_list_item {
             node_list_item_child(doc, node_id, ordinal)
         } else {
