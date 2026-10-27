@@ -1043,6 +1043,35 @@ impl<'a> TElement for BlitzNode<'a> {
             let name = &attr.name.local;
             let value = attr.value.as_str();
 
+            // The HTML start attribute maps to a presentational hint, so
+            // author counter-reset declarations win in the cascade.
+            if elem.name.ns == ns!(html) && attr.name.ns == ns!() {
+                use style::values::CustomIdent;
+                use style::values::generics::counters::CounterPair;
+                use style::values::specified::Integer;
+                use style::values::specified::counters::CounterReset;
+
+                let counter = |ordinal, is_reversed| CounterPair {
+                    name: CustomIdent(Atom::from("list-item")),
+                    value: Integer::new(ordinal),
+                    is_reversed,
+                };
+
+                if *tag == local_name!("ol") && *name == local_name!("start") {
+                    if let Ok(start) = value.trim().parse::<i32>() {
+                        let reversed = elem.has_attr(local_name!("reversed"));
+                        let initial = if reversed {
+                            start.saturating_add(1)
+                        } else {
+                            start.saturating_sub(1)
+                        };
+                        push_style(PropertyDeclaration::CounterReset(CounterReset::new(vec![
+                            counter(initial, reversed),
+                        ])));
+                    }
+                }
+            }
+
             if *name == local_name!("lang") {
                 if attr.name.ns == ns!(xml) {
                     lang = Some(value);
