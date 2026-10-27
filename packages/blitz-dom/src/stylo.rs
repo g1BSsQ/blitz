@@ -1043,6 +1043,41 @@ impl<'a> TElement for BlitzNode<'a> {
             let name = &attr.name.local;
             let value = attr.value.as_str();
 
+            // HTML list ordinals are presentational hints: author CSS must be
+            // able to override these values through the normal cascade.
+            if elem.name.ns == ns!(html) && attr.name.ns == ns!() {
+                use style::values::CustomIdent;
+                use style::values::generics::counters::CounterPair;
+                use style::values::specified::Integer;
+                use style::values::specified::counters::{CounterReset, CounterSet};
+
+                let counter = |ordinal, is_reversed| CounterPair {
+                    name: CustomIdent(Atom::from("list-item")),
+                    value: Integer::new(ordinal),
+                    is_reversed,
+                };
+
+                if *tag == local_name!("ol") && *name == local_name!("start") {
+                    if let Ok(start) = value.trim().parse::<i32>() {
+                        let reversed = elem.has_attr(local_name!("reversed"));
+                        let initial = if reversed {
+                            start.saturating_add(1)
+                        } else {
+                            start.saturating_sub(1)
+                        };
+                        push_style(PropertyDeclaration::CounterReset(CounterReset::new(vec![
+                            counter(initial, reversed),
+                        ])));
+                    }
+                } else if *tag == local_name!("li") && *name == local_name!("value") {
+                    if let Ok(value) = value.trim().parse::<i32>() {
+                        push_style(PropertyDeclaration::CounterSet(CounterSet::new(vec![
+                            counter(value, false),
+                        ])));
+                    }
+                }
+            }
+
             if *name == local_name!("lang") {
                 if attr.name.ns == ns!(xml) {
                     lang = Some(value);

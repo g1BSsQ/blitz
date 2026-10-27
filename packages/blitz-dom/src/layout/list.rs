@@ -1,11 +1,10 @@
 use blitz_traits::node_id::NodeId;
-use markup5ever::local_name;
 use parley::FontFamily;
 use style::computed_values::list_style_type::T as ListStyleType;
 use style::{
     computed_values::list_style_position::T as ListStylePosition,
     counter_style::CounterStyle,
-    values::specified::box_::DisplayInside,
+    values::{computed::Contain, specified::box_::DisplayInside},
 };
 use stylo_taffy::CopyStyleGetters;
 
@@ -35,25 +34,8 @@ struct CounterProperties {
     is_list_item: bool,
 }
 
-fn is_ordered_list(doc: &BaseDocument, node_id: NodeId, inherited: bool) -> bool {
-    doc.nodes[node_id].element_data().map_or(inherited, |el| {
-        if el.name.local == local_name!("ol") {
-            true
-        } else if matches!(el.name.local, local_name!("ul") | local_name!("menu")) {
-            false
-        } else {
-            inherited
-        }
-    })
-}
-
-// Read the cascaded counter properties, not the CSS source text. HTML ordinal
-// attributes provide the defaults for lists and items when CSS doesn't set them.
-fn counter_properties(
-    doc: &BaseDocument,
-    node_id: NodeId,
-    ordered: bool,
-) -> Option<CounterProperties> {
+// Read the cascaded counter properties, not the CSS source text.
+fn counter_properties(doc: &BaseDocument, node_id: NodeId) -> Option<CounterProperties> {
     let node = &doc.nodes[node_id];
     if node
         .display_style()
@@ -88,27 +70,20 @@ fn counter_properties(
         properties.is_list_item = style.get_box().display.is_list_item();
     }
 
-    if let Some(el) = node.element_data() {
-        if ordered && el.name.local == local_name!("li") && properties.set.is_none() {
-            properties.set = el.attr_parsed(local_name!("value"));
-        }
-        if el.name.local == local_name!("ol") {
-            if let Some(start) = el.attr_parsed::<i32>(local_name!("start")) {
-                if let Some((value, reversed)) = properties.reset.as_mut() {
-                    // The UA reset defaults to 0 or to the implicit reversed
-                    // value. Explicit CSS counter-reset values take precedence.
-                    if (*value == 0 && !*reversed) || (*value == i32::MIN && *reversed) {
-                        *value = if *reversed {
-                            start.saturating_add(1)
-                        } else {
-                            start.saturating_sub(1)
-                        };
-                    }
-                }
-            }
-        }
-    }
     Some(properties)
+}
+
+// Style containment scopes increments and sets in descendants, but not on
+// the containing element itself. display:contents does not establish it.
+fn has_style_containment(doc: &BaseDocument, node_id: NodeId) -> bool {
+    let node = &doc.nodes[node_id];
+    if node.display_style().is_some_and(|display| {
+        matches!(display.inside(), DisplayInside::None | DisplayInside::Contents)
+    }) {
+        return false;
+    }
+    node.primary_styles()
+        .is_some_and(|style| style.clone_contain().contains(Contain::STYLE))
 }
 
 fn child_ids(doc: &BaseDocument, node_id: NodeId) -> Vec<NodeId> {
@@ -122,17 +97,15 @@ fn child_ids(doc: &BaseDocument, node_id: NodeId) -> Vec<NodeId> {
 
 // CSS Lists 3 §4.4.2: an implicit reversed reset counts negated increments
 // until the first set, then includes the final nonzero increment once more.
-fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId, ordered: bool) -> i32 {
+fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId) -> i32 {
     fn count(
         doc: &BaseDocument,
         node_id: NodeId,
-        ordered: bool,
         total: &mut i32,
         last_increment: &mut i32,
     ) -> bool {
         for child in child_ids(doc, node_id) {
-            let ordered = is_ordered_list(doc, child, ordered);
-            let Some(props) = counter_properties(doc, child, ordered) else {
+            let Some(props) = counter_properties(doc, child) else {
                 continue;
             };
             // A reset shadows this counter for the reset element and the
@@ -152,7 +125,9 @@ fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId, ordered: bool) ->
                 return true;
             }
             *total = total.saturating_add(increment);
-            if count(doc, child, ordered, total, last_increment) {
+            if !has_style_containment(doc, child)
+                && count(doc, child, total, last_increment)
+            {
                 return true;
             }
         }
@@ -161,7 +136,7 @@ fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId, ordered: bool) ->
 
     let mut total: i32 = 0;
     let mut last_increment: i32 = 0;
-    count(doc, node_id, ordered, &mut total, &mut last_increment);
+    count(doc, node_id, &mut total, &mut last_increment);
     total.saturating_add(last_increment)
 }
 
@@ -170,11 +145,9 @@ pub(super) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
         doc: &mut BaseDocument,
         node_id: NodeId,
         depth: usize,
-        ordered: bool,
         counters: &mut Vec<ListCounter>,
     ) {
-        let ordered = is_ordered_list(doc, node_id, ordered);
-        let Some(props) = counter_properties(doc, node_id, ordered) else {
+        let Some(props) = counter_properties(doc, node_id) else {
             return;
         };
 
@@ -185,7 +158,7 @@ pub(super) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
                 counters.pop();
             }
             let value = if reversed && value == i32::MIN {
-                reversed_initial_value(doc, node_id, ordered)
+                reversed_initial_value(doc, node_id)
             } else {
                 value
             };
@@ -228,14 +201,21 @@ pub(super) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
 
         // A descendant's reset survives among its siblings, but not beyond
         // the enclosing element. Updates to inherited counters do survive.
-        let count = counters.len();
-        for child in child_ids(doc, node_id) {
-            visit(doc, child, depth + 1, ordered, counters);
+        if has_style_containment(doc, node_id) {
+            let mut contained = Vec::new();
+            for child in child_ids(doc, node_id) {
+                visit(doc, child, depth + 1, &mut contained);
+            }
+        } else {
+            let count = counters.len();
+            for child in child_ids(doc, node_id) {
+                visit(doc, child, depth + 1, counters);
+            }
+            counters.truncate(count);
         }
-        counters.truncate(count);
     }
 
-    visit(doc, root, 0, false, &mut Vec::new());
+    visit(doc, root, 0, &mut Vec::new());
 }
 
 // Return the marker for an element whose computed display is list-item.
@@ -361,7 +341,6 @@ fn build_alpha_marker(index: usize, str: &mut String) {
         build_alpha_marker(rest as usize, str);
     }
 }
-
 
 fn build_roman_marker(mut value: usize, marker: &mut String) {
     for (amount, symbol) in [
