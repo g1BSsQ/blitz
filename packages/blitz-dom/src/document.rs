@@ -100,7 +100,7 @@ impl UserAgentStylesheet {
     /// The default user-agent stylesheet ([`DEFAULT_CSS`]), parsed once.
     pub fn default_sheet() -> Self {
         static SHEET: LazyLock<UserAgentStylesheet> =
-            LazyLock::new(|| UserAgentStylesheet::parse(DEFAULT_CSS));
+            LazyLock::new(|| { eprintln!("DBGUB1 ua-parse counters_pref={}", style_config::get_bool("layout.css.counters.enabled")); style_config::set_pref!("layout.css.counters.enabled", true); UserAgentStylesheet::parse(DEFAULT_CSS) });
         SHEET.clone()
     }
 
