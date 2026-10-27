@@ -1,0 +1,69 @@
+# Fork-only helper (not for upstream): compare WPT results of a branch against main
+# on a free hosted runner, for selected suites.
+name: Fork WPT compare
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to test
+        required: true
+      suites:
+        description: Space-separated WPT paths
+        required: true
+        default: "css/css-lists css/css-contain"
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      WPT_DIR: ./wpt/tests
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Fontconfig and fonts
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev fonts-tlwg-loma-otf
+      - name: Clone WPT tests
+        run: git clone --depth 1 --revision "$(cat ./wpt/WPT_COMMIT)" https://github.com/web-platform-tests/wpt ./wpt/tests
+      - name: Run WPT on the branch
+        run: |
+          cargo run -rp wpt ${{ inputs.suites }} || true
+          cp wpt/output/wptreport.json /tmp/branch.json
+      - name: Run WPT on upstream main merge-base
+        run: |
+          git remote add upstream https://github.com/DioxusLabs/blitz
+          git fetch -q upstream main
+          base=$(git merge-base HEAD upstream/main)
+          echo "base=$base"
+          git checkout -q "$base"
+          cargo run -rp wpt ${{ inputs.suites }} || true
+          cp wpt/output/wptreport.json /tmp/base.json
+      - name: Diff
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          def load(p):
+              d = json.load(open(p))
+              return {r["test"]: r["status"] for r in d["results"]}
+          b, h = load("/tmp/base.json"), load("/tmp/branch.json")
+          up = sorted(t for t in h if h[t] == "PASS" and b.get(t) != "PASS")
+          down = sorted(t for t in h if b.get(t) == "PASS" and h[t] != "PASS")
+          print(f"base PASS {sum(v=='PASS' for v in b.values())}/{len(b)}, branch PASS {sum(v=='PASS' for v in h.values())}/{len(h)}")
+          print(f"newly passing {len(up)}, newly failing {len(down)}")
+          print("```diff")
+          for t in up: print("+ " + t)
+          for t in down: print("- " + t)
+          print("```")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: wpt-compare
+          path: /tmp/*.json
