@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    damage::ALL_DAMAGE, list::collect_list_item_children, replaced::is_inline_box_element,
+    damage::ALL_DAMAGE, replaced::is_inline_box_element,
     table::build_table_context,
 };
 
@@ -472,18 +472,6 @@ fn collect_layout_children_with_wrap(
             return;
         }
 
-        //Only ol tags have start and reversed attributes
-        let (mut index, reversed) = if tag_name == "ol" {
-            (
-                el.attr_parsed(local_name!("start"))
-                    .map(|start: usize| start - 1)
-                    .unwrap_or(0),
-                el.attr_parsed(local_name!("reversed")).unwrap_or(false),
-            )
-        } else {
-            (0, false)
-        };
-        collect_list_item_children(doc, &mut index, reversed, container_node_id);
     }
 
     // Skip further construction if the node has no children or psuedo-children

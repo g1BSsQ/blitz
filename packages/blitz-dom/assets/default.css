@@ -727,6 +727,11 @@ menu {
     counter-reset: list-item;
 }
 
+/* The computed reset, not the attribute, controls the counter direction. */
+ol[reversed] {
+    counter-reset: reversed(list-item);
+}
+
 ol {
     display: block;
     list-style-type: decimal;
