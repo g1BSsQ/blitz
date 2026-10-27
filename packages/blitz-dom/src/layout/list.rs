@@ -1,5 +1,4 @@
 use blitz_traits::node_id::NodeId;
-use markup5ever::local_name;
 use parley::FontFamily;
 use style::computed_values::list_style_type::T as ListStyleType;
 use style::{
@@ -31,7 +30,7 @@ struct ListCounter {
 struct CounterProperties {
     reset: Option<(i32, bool)>,
     increment: Option<i32>,
-    value: Option<i32>,
+    set: Option<i32>,
     is_list_item: bool,
 }
 
@@ -63,15 +62,12 @@ fn counter_properties(doc: &BaseDocument, node_id: NodeId) -> Option<CounterProp
                     .saturating_add(pair.value),
             );
         }
+        properties.set = counters
+            .counter_set
+            .iter()
+            .rfind(|pair| list_item(&pair.name))
+            .map(|pair| pair.value);
         properties.is_list_item = style.get_box().display.is_list_item();
-    }
-
-    // HTML's value attribute sets the item's ordinal independent of CSS
-    // counter-set, which the Servo Stylo build does not expose.
-    if let Some(el) = node.element_data() {
-        if el.name.local == local_name!("li") {
-            properties.value = el.attr_parsed(local_name!("value"));
-        }
     }
 
     Some(properties)
@@ -100,7 +96,7 @@ fn child_ids(doc: &BaseDocument, node_id: NodeId) -> Vec<NodeId> {
 }
 
 // CSS Lists 3 §4.4.2: an implicit reversed reset counts negated increments
-// until the first explicit HTML item value, then adds that value.
+// until the first set, then includes the final nonzero increment once more.
 fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId) -> i32 {
     fn count(
         doc: &BaseDocument,
@@ -124,8 +120,8 @@ fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId) -> i32 {
             if increment != 0 {
                 *last_increment = increment;
             }
-            if let Some(value) = props.value {
-                *total = total.saturating_add(value);
+            if let Some(set) = props.set {
+                *total = total.saturating_add(set);
                 return true;
             }
             *total = total.saturating_add(increment);
@@ -173,7 +169,7 @@ pub(crate) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
             });
         }
 
-        if props.is_list_item || props.increment.is_some() || props.value.is_some() {
+        if props.is_list_item || props.increment.is_some() || props.set.is_some() {
             if counters.is_empty() {
                 counters.push(ListCounter {
                     value: 0,
@@ -188,8 +184,10 @@ pub(crate) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
                 0
             });
             counter.value = counter.value.saturating_add(increment);
-            if let Some(value) = props.value {
-                counter.value = value;
+            // CSS Lists 3: counter-set runs after the explicit or implicit
+            // increment and creates the counter when one did not exist.
+            if let Some(set) = props.set {
+                counter.value = set;
             }
         }
 
