@@ -1043,13 +1043,13 @@ impl<'a> TElement for BlitzNode<'a> {
             let name = &attr.name.local;
             let value = attr.value.as_str();
 
-            // HTML list ordinals are presentational hints: author CSS must be
-            // able to override these values through the normal cascade.
+            // The HTML start attribute maps to a presentational hint, so
+            // author counter-reset declarations win in the cascade.
             if elem.name.ns == ns!(html) && attr.name.ns == ns!() {
                 use style::values::CustomIdent;
                 use style::values::generics::counters::CounterPair;
                 use style::values::specified::Integer;
-                use style::values::specified::counters::{CounterReset, CounterSet};
+                use style::values::specified::counters::CounterReset;
 
                 let counter = |ordinal, is_reversed| CounterPair {
                     name: CustomIdent(Atom::from("list-item")),
@@ -1067,12 +1067,6 @@ impl<'a> TElement for BlitzNode<'a> {
                         };
                         push_style(PropertyDeclaration::CounterReset(CounterReset::new(vec![
                             counter(initial, reversed),
-                        ])));
-                    }
-                } else if *tag == local_name!("li") && *name == local_name!("value") {
-                    if let Ok(value) = value.trim().parse::<i32>() {
-                        push_style(PropertyDeclaration::CounterSet(CounterSet::new(vec![
-                            counter(value, false),
                         ])));
                     }
                 }
