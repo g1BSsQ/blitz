@@ -404,6 +404,12 @@ pub(crate) fn fetch_font_face(
     )
 }
 
+// CSS Fonts: an omitted or unresolvable @font-face weight is normal (400),
+// not the weight stored in the font file's metadata.
+fn font_face_weight(descriptor_weight: Option<f32>) -> f32 {
+    descriptor_weight.unwrap_or(400.0)
+}
+
 /// Fetch the fonts of the `@font-face` rules among `rules`
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_font_face_rules<'a>(
@@ -427,10 +433,12 @@ pub(crate) fn fetch_font_face_rules<'a>(
                 // style) rather than whatever metadata the TTF reports.
                 let overrides = FontFaceOverrides {
                     family_name: Some(family.name.to_string()),
-                    weight: descriptor
-                        .font_weight
-                        .as_ref()
-                        .and_then(|range| range.0.compute().map(|w| w.value())),
+                    weight: Some(font_face_weight(
+                        descriptor
+                            .font_weight
+                            .as_ref()
+                            .and_then(|range| range.0.compute().map(|w| w.value())),
+                    )),
                     style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
                 };
                 Some((src, overrides))
@@ -649,5 +657,16 @@ mod tests {
             stylo_to_fontique_style(&oblique(10.0, 20.0)),
             Fq::Oblique(Some(10.0)),
         );
+    }
+}
+
+#[cfg(test)]
+mod font_face_weight_tests {
+    use super::font_face_weight;
+
+    #[test]
+    fn missing_or_unresolved_descriptor_weight_defaults_to_normal() {
+        assert_eq!(font_face_weight(None), 400.0);
+        assert_eq!(font_face_weight(Some(700.0)), 700.0);
     }
 }
