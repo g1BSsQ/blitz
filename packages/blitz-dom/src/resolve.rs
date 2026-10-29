@@ -248,7 +248,9 @@ impl BaseDocument {
 
     /// Ensure that the layout_children field is populated for all nodes
     pub fn resolve_layout_children(&mut self) {
-        resolve_layout_children_recursive(self, self.root_node().id);
+        let root = self.root_node().id;
+        resolve_layout_children_recursive(self, root);
+        crate::layout::list::collect_list_item_children(self, root);
 
         fn resolve_layout_children_recursive(doc: &mut BaseDocument, node_id: NodeId) {
             // Anonymous blocks and pseudo-elements can be removed from the slab

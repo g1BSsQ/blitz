@@ -723,6 +723,10 @@ menu {
     counter-reset: list-item;
 }
 
+ol[reversed] {
+    counter-reset: reversed(list-item);
+}
+
 ol {
     display: block;
     list-style-type: decimal;

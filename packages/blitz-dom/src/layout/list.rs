@@ -1,9 +1,10 @@
 use blitz_traits::node_id::NodeId;
-use markup5ever::local_name;
 use parley::FontFamily;
 use style::computed_values::list_style_type::T as ListStyleType;
 use style::{
-    computed_values::list_style_position::T as ListStylePosition, counter_style::CounterStyle,
+    computed_values::list_style_position::T as ListStylePosition,
+    counter_style::CounterStyle,
+    values::{computed::Contain, specified::box_::DisplayInside},
 };
 use stylo_taffy::CopyStyleGetters;
 
@@ -15,66 +16,221 @@ use crate::{
 
 pub(super) const BULLET_FONT_FAMILY: &str = "Bullet, monospace, sans-serif";
 
-pub(super) fn collect_list_item_children(
-    doc: &mut BaseDocument,
-    index: &mut usize,
+// Counter instances live across following siblings, but instances created by
+// descendants are discarded when leaving their parent. The depth distinguishes
+// an inherited counter from a counter reset by an earlier sibling.
+#[derive(Clone, Copy)]
+struct ListCounter {
+    value: i32,
     reversed: bool,
-    node_id: NodeId,
-) {
-    let mut children = doc.nodes[node_id].children.clone();
-    if reversed {
-        children.reverse();
-    }
-    for child in children.into_iter() {
-        if let Some(layout) = node_list_item_child(doc, child, *index) {
-            let node = &mut doc.nodes[child];
-            node.element_data_mut().unwrap().list_item_data = Some(Box::new(layout));
-            *index += 1;
-            collect_list_item_children(doc, index, reversed, child);
-        } else {
-            // Unset marker in case it was previously set
-            let node = &mut doc.nodes[child];
-            if let Some(element_data) = node.element_data_mut() {
-                element_data.list_item_data = None;
-            }
-        }
-    }
+    depth: usize,
 }
 
-// Return a child node which is of display: list-item
+#[derive(Default)]
+struct CounterProperties {
+    reset: Option<(i32, bool)>,
+    increment: Option<i32>,
+    set: Option<i32>,
+    is_list_item: bool,
+}
+
+// Read the cascaded counter properties, not the CSS source text.
+fn counter_properties(doc: &BaseDocument, node_id: NodeId) -> Option<CounterProperties> {
+    let node = &doc.nodes[node_id];
+    if node
+        .display_style()
+        .is_some_and(|display| display.inside() == DisplayInside::None)
+    {
+        return None;
+    }
+
+    let mut properties = CounterProperties::default();
+    if let Some(style) = node.primary_styles() {
+        let counters = style.get_counters();
+        let list_item = |name: &style::values::CustomIdent| &*name.0 == "list-item";
+
+        properties.reset = counters
+            .counter_reset
+            .iter()
+            .rfind(|pair| list_item(&pair.name))
+            .map(|pair| (pair.value, pair.is_reversed));
+        for pair in counters.counter_increment.iter().filter(|pair| list_item(&pair.name)) {
+            properties.increment = Some(
+                properties
+                    .increment
+                    .unwrap_or(0)
+                    .saturating_add(pair.value),
+            );
+        }
+        properties.set = counters
+            .counter_set
+            .iter()
+            .rfind(|pair| list_item(&pair.name))
+            .map(|pair| pair.value);
+        properties.is_list_item = style.get_box().display.is_list_item();
+    }
+
+    Some(properties)
+}
+
+// Style containment scopes increments and sets in descendants, but not on
+// the containing element itself. display:contents does not establish it.
+fn has_style_containment(doc: &BaseDocument, node_id: NodeId) -> bool {
+    let node = &doc.nodes[node_id];
+    if node.display_style().is_some_and(|display| {
+        matches!(display.inside(), DisplayInside::None | DisplayInside::Contents)
+    }) {
+        return false;
+    }
+    node.primary_styles()
+        .is_some_and(|style| style.clone_contain().contains(Contain::STYLE))
+}
+
+fn child_ids(doc: &BaseDocument, node_id: NodeId) -> Vec<NodeId> {
+    let node = &doc.nodes[node_id];
+    node.before()
+        .into_iter()
+        .chain(node.children.iter().copied())
+        .chain(node.after())
+        .collect()
+}
+
+// CSS Lists 3 §4.4.2: an implicit reversed reset counts negated increments
+// until the first set, then includes the final nonzero increment once more.
+fn reversed_initial_value(doc: &BaseDocument, node_id: NodeId) -> i32 {
+    fn count(
+        doc: &BaseDocument,
+        node_id: NodeId,
+        total: &mut i32,
+        last_increment: &mut i32,
+    ) -> bool {
+        for child in child_ids(doc, node_id) {
+            let Some(props) = counter_properties(doc, child) else {
+                continue;
+            };
+            // A reset shadows this counter for the reset element and the
+            // following siblings at this level. Nested lists cannot count.
+            if props.reset.is_some() {
+                break;
+            }
+            let increment = props
+                .increment
+                .unwrap_or(if props.is_list_item { -1 } else { 0 })
+                .saturating_neg();
+            if increment != 0 {
+                *last_increment = increment;
+            }
+            if let Some(set) = props.set {
+                *total = total.saturating_add(set);
+                return true;
+            }
+            *total = total.saturating_add(increment);
+            if !has_style_containment(doc, child)
+                && count(doc, child, total, last_increment)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut total: i32 = 0;
+    let mut last_increment: i32 = 0;
+    count(doc, node_id, &mut total, &mut last_increment);
+    total.saturating_add(last_increment)
+}
+
+pub(crate) fn collect_list_item_children(doc: &mut BaseDocument, root: NodeId) {
+    fn visit(
+        doc: &mut BaseDocument,
+        node_id: NodeId,
+        depth: usize,
+        counters: &mut Vec<ListCounter>,
+    ) {
+        let Some(props) = counter_properties(doc, node_id) else {
+            return;
+        };
+
+        if let Some((value, reversed)) = props.reset {
+            // A reset on a sibling replaces that sibling's counter, while a
+            // reset on a descendant instantiates a nested counter.
+            while counters.last().is_some_and(|counter| counter.depth >= depth) {
+                counters.pop();
+            }
+            let value = if reversed && value == i32::MIN {
+                reversed_initial_value(doc, node_id)
+            } else {
+                value
+            };
+            counters.push(ListCounter {
+                value,
+                reversed,
+                depth,
+            });
+        }
+
+        if props.is_list_item || props.increment.is_some() || props.set.is_some() {
+            if counters.is_empty() {
+                counters.push(ListCounter {
+                    value: 0,
+                    reversed: false,
+                    depth,
+                });
+            }
+            let counter = counters.last_mut().unwrap();
+            let increment = props.increment.unwrap_or(if props.is_list_item {
+                if counter.reversed { -1 } else { 1 }
+            } else {
+                0
+            });
+            counter.value = counter.value.saturating_add(increment);
+            // CSS Lists 3: counter-set runs after the explicit or implicit
+            // increment and creates the counter when one did not exist.
+            if let Some(set) = props.set {
+                counter.value = set;
+            }
+        }
+
+        let ordinal = counters.last().map_or(0, |counter| counter.value);
+        let layout = if props.is_list_item {
+            node_list_item_child(doc, node_id, ordinal)
+        } else {
+            None
+        };
+        if let Some(element) = doc.nodes[node_id].element_data_mut() {
+            element.list_item_data = layout.map(Box::new);
+        }
+
+        // A descendant's reset survives among its siblings, but not beyond
+        // the enclosing element. Updates to inherited counters do survive.
+        if has_style_containment(doc, node_id) {
+            let mut contained = Vec::new();
+            for child in child_ids(doc, node_id) {
+                visit(doc, child, depth + 1, &mut contained);
+            }
+        } else {
+            let count = counters.len();
+            for child in child_ids(doc, node_id) {
+                visit(doc, child, depth + 1, counters);
+            }
+            counters.truncate(count);
+        }
+    }
+
+    visit(doc, root, 0, &mut Vec::new());
+}
+
+// Return the marker for an element whose computed display is list-item.
 fn node_list_item_child(
     doc: &mut BaseDocument,
     child_id: NodeId,
-    index: usize,
+    ordinal: i32,
 ) -> Option<ListItemLayout> {
     let node = &doc.nodes[child_id];
-
-    // We only care about elements with display: list-item (li's have this automatically)
-    if !node
-        .primary_styles()
-        .is_some_and(|style| style.get_box().display.is_list_item())
-    {
-        return None;
-    }
-
-    //Break on container elements when already in a list
-    if node
-        .element_data()
-        .map(|element_data| {
-            matches!(
-                element_data.name.local,
-                local_name!("ol") | local_name!("ul"),
-            )
-        })
-        .unwrap_or(false)
-    {
-        return None;
-    };
-
-    let styles = node.primary_styles().unwrap();
+    let styles = node.primary_styles()?;
     let list_style_type = styles.get_list_style_type();
     let list_style_position = styles.clone_list_style_position();
-    let marker = marker_for_style(list_style_type, index)?;
+    let marker = marker_for_style(list_style_type, ordinal)?;
 
     let position = match list_style_position {
         ListStylePosition::Inside => ListItemLayoutPosition::Inside,
@@ -85,7 +241,6 @@ fn node_list_item_child(
                 parley_style.font_family = font_family;
             }
 
-            // Create a parley tree builder
             let mut font_ctx = doc.font_ctx.lock().unwrap();
             let mut builder = doc.layout_ctx.tree_builder(
                 &mut font_ctx,
@@ -113,22 +268,31 @@ fn node_list_item_child(
     Some(ListItemLayout { marker, position })
 }
 
-// Determine the marker to render for a given list style type
-fn marker_for_style(list_style_type: &ListStyleType, index: usize) -> Option<Marker> {
+// Format the counter's actual value. Styles with a positive-only range fall
+// back to decimal for zero and negative values.
+fn marker_for_style(list_style_type: &ListStyleType, ordinal: i32) -> Option<Marker> {
+    let decimal = || Marker::String(format!("{ordinal}. "));
     Some(match &list_style_type.0 {
         CounterStyle::None => return None,
         CounterStyle::Name(name) => match &*name.0 {
-            "lower-alpha" => {
+            "lower-alpha" | "upper-alpha" if ordinal > 0 => {
                 let mut marker = String::new();
-                build_alpha_marker(index, &mut marker);
+                build_alpha_marker((ordinal - 1) as usize, &mut marker);
+                if &*name.0 == "upper-alpha" {
+                    marker.make_ascii_uppercase();
+                }
                 Marker::String(format!("{marker}. "))
             }
-            "upper-alpha" => {
+            "lower-roman" | "upper-roman" if (1..=3999).contains(&ordinal) => {
                 let mut marker = String::new();
-                build_alpha_marker(index, &mut marker);
-                Marker::String(format!("{}. ", marker.to_ascii_uppercase()))
+                build_roman_marker(ordinal as usize, &mut marker);
+                if &*name.0 == "upper-roman" {
+                    marker.make_ascii_uppercase();
+                }
+                Marker::String(format!("{marker}. "))
             }
-            "decimal" => Marker::String(format!("{}. ", index + 1)),
+            "decimal" => decimal(),
+            "lower-alpha" | "upper-alpha" | "lower-roman" | "upper-roman" => decimal(),
             "disc" => Marker::Char('•'),
             "circle" => Marker::Char('◦'),
             "square" => Marker::Char('▪'),
@@ -138,16 +302,13 @@ fn marker_for_style(list_style_type: &ListStyleType, index: usize) -> Option<Mar
         },
         CounterStyle::String(atom_string) => Marker::String(atom_string.as_ref().to_string()),
         CounterStyle::Symbols { symbols, .. } => {
-            // Use symbols from counter-style definition
             let syms = &symbols.0;
-            let len = syms.len();
-            if len == 0 {
+            if syms.is_empty() {
                 Marker::Char('•')
+            } else if ordinal <= 0 {
+                decimal()
             } else {
-                // Cycle through symbols based on index: 1st, 2nd, 1st, 2nd, etc.
-                let idx = if len > 1 { index % len } else { 0 };
-                // Symbol is String or Ident variant, extract the string value
-                let sym = &syms[idx];
+                let sym = &syms[(ordinal as usize - 1) % syms.len()];
                 let marker_str = match sym {
                     style::counter_style::Symbol::String(s) => s.to_string(),
                     style::counter_style::Symbol::Ident(id) => id.0.to_string(),
@@ -183,6 +344,29 @@ fn build_alpha_marker(index: usize, str: &mut String) {
     }
 }
 
+fn build_roman_marker(mut value: usize, marker: &mut String) {
+    for (amount, symbol) in [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ] {
+        while value >= amount {
+            marker.push_str(symbol);
+            value -= amount;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::node::Marker;
@@ -200,39 +384,64 @@ mod tests {
 
     #[test]
     fn test_marker_for_disc() {
-        let result = marker_for_style(&ListStyleType::disc(), 0);
+        let result = marker_for_style(&ListStyleType::disc(), 1);
         assert_eq!(result, Some(Marker::Char('•')));
     }
 
     #[test]
     fn test_marker_for_decimal() {
-        let result_1 = marker_for_style(&list_style("decimal"), 0);
-        let result_2 = marker_for_style(&list_style("decimal"), 1);
-        assert_eq!(result_1, Some(Marker::String("1. ".to_string())));
-        assert_eq!(result_2, Some(Marker::String("2. ".to_string())));
+        let style = list_style("decimal");
+        assert_eq!(
+            marker_for_style(&style, 1),
+            Some(Marker::String("1. ".to_string()))
+        );
+        assert_eq!(
+            marker_for_style(&style, -2),
+            Some(Marker::String("-2. ".to_string()))
+        );
     }
 
     #[test]
     fn test_marker_for_lower_alpha() {
-        let result_1 = marker_for_style(&list_style("lower-alpha"), 0);
-        let result_2 = marker_for_style(&list_style("lower-alpha"), 1);
-        let result_extended_1 = marker_for_style(&list_style("lower-alpha"), 26);
-        let result_extended_2 = marker_for_style(&list_style("lower-alpha"), 27);
-        assert_eq!(result_1, Some(Marker::String("a. ".to_string())));
-        assert_eq!(result_2, Some(Marker::String("b. ".to_string())));
-        assert_eq!(result_extended_1, Some(Marker::String("aa. ".to_string())));
-        assert_eq!(result_extended_2, Some(Marker::String("ab. ".to_string())));
+        let style = list_style("lower-alpha");
+        for (ordinal, expected) in [(1, "a. "), (2, "b. "), (27, "aa. "), (28, "ab. ")] {
+            assert_eq!(
+                marker_for_style(&style, ordinal),
+                Some(Marker::String(expected.to_string()))
+            );
+        }
+        assert_eq!(
+            marker_for_style(&style, 0),
+            Some(Marker::String("0. ".to_string()))
+        );
     }
 
     #[test]
     fn test_marker_for_upper_alpha() {
-        let result_1 = marker_for_style(&list_style("upper-alpha"), 0);
-        let result_2 = marker_for_style(&list_style("upper-alpha"), 1);
-        let result_extended_1 = marker_for_style(&list_style("upper-alpha"), 26);
-        let result_extended_2 = marker_for_style(&list_style("upper-alpha"), 27);
-        assert_eq!(result_1, Some(Marker::String("A. ".to_string())));
-        assert_eq!(result_2, Some(Marker::String("B. ".to_string())));
-        assert_eq!(result_extended_1, Some(Marker::String("AA. ".to_string())));
-        assert_eq!(result_extended_2, Some(Marker::String("AB. ".to_string())));
+        let style = list_style("upper-alpha");
+        for (ordinal, expected) in [(1, "A. "), (2, "B. "), (27, "AA. "), (28, "AB. ")] {
+            assert_eq!(
+                marker_for_style(&style, ordinal),
+                Some(Marker::String(expected.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_marker_for_roman() {
+        let style = list_style("lower-roman");
+        assert_eq!(
+            marker_for_style(&style, 4),
+            Some(Marker::String("iv. ".to_string()))
+        );
+        let style = list_style("upper-roman");
+        assert_eq!(
+            marker_for_style(&style, 9),
+            Some(Marker::String("IX. ".to_string()))
+        );
+        assert_eq!(
+            marker_for_style(&style, -1),
+            Some(Marker::String("-1. ".to_string()))
+        );
     }
 }
