@@ -95,6 +95,42 @@ fn win_ascent_ratio(font: &parley::FontData) -> Option<f32> {
     Some(win_ascent as f32 / units_per_em as f32)
 }
 
+/// Whether the actual face already carries bold outlines. A CSS face rule
+/// with no weight descriptor can still refer to an intrinsically bold file;
+/// in that case synthetic emboldening would make the file heavier twice.
+fn intrinsic_bold_face(font: &parley::FontData) -> bool {
+    use skrifa::raw::{FontRef, TableProvider as _};
+    let Ok(face) = FontRef::from_index(font.data.as_ref(), font.index) else {
+        return false;
+    };
+    face.os2().is_ok_and(|os2| os2.us_weight_class() >= 700)
+}
+
+fn should_synthesize_bold(requested: bool, allowed: bool, already_bold: bool) -> bool {
+    requested && allowed && !already_bold
+}
+
+/// Offsets for a small stroke-and-fill approximation of synthetic weight.
+/// Applying each offset to the whole shaped glyph run preserves every GPOS
+/// base-to-mark placement, even for zero-advance combining glyphs. In contrast,
+/// outline expansion based on a glyph's aggregate signed area can shrink one
+/// of several disconnected subpaths with opposite winding.
+fn synthetic_bold_offsets(font_size: f32) -> [(f64, f64); 9] {
+    let outset = f64::from(font_size) / 24.0;
+    let diagonal = outset * std::f64::consts::FRAC_1_SQRT_2;
+    [
+        (0.0, 0.0),
+        (outset, 0.0),
+        (-outset, 0.0),
+        (0.0, outset),
+        (0.0, -outset),
+        (diagonal, diagonal),
+        (-diagonal, diagonal),
+        (diagonal, -diagonal),
+        (-diagonal, -diagonal),
+    ]
+}
+
 /// Mirrors Blink's `SelectBestDashGap`: choose the gap length (as close as possible to
 /// `gap_length`) that fits a whole number of `dash_length` dashes across `stroke_length`,
 /// so dashes are evenly distributed and a dash lands at each end of the line.
@@ -638,7 +674,24 @@ pub(crate) fn stroke_text<'a>(
                 // inherits, so the innermost inline element already carries the right value.
                 let text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
 
-                let embolden = if FONT_EMBOLDEN_ENABLED {
+                // Fontique selects real faces first and requests synthetic bold
+                // only when the family has no appropriate bold face.
+                // The shaping engine reports a missing declared bold face,
+                // but the paint step must also respect the element's computed
+                // synthesis policy and the file's intrinsic weight class.
+                // Fast path: avoid style and font-table lookups for ordinary
+                // runs. If weight synthesis is disabled, do not inspect OS/2.
+                let synthetic_bold = synthesis.embolden() && {
+                    let allowed = doc
+                        .get_node(style.brush.id)
+                        .and_then(|node| node.primary_styles())
+                        .is_none_or(|values| {
+                            values.get_font().font_synthesis_weight
+                                != style::values::computed::font::FontSynthesis::None
+                        });
+                    allowed && should_synthesize_bold(true, allowed, intrinsic_bold_face(font))
+                };
+                let embolden = if FONT_EMBOLDEN_ENABLED && !synthetic_bold {
                     let fs = font_size as f64 / scale;
                     kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
                 } else {
@@ -646,23 +699,36 @@ pub(crate) fn stroke_text<'a>(
                 };
 
                 let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                scene.draw_glyphs(
-                    font,
-                    font_size,
-                    !FONT_EMBOLDEN_ENABLED, // hint
-                    normalized_coords,
-                    embolden,
-                    Fill::NonZero,
-                    &anyrender::Paint::from(text_color),
-                    1.0, // alpha
-                    transform,
-                    glyph_xform,
-                    glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    }),
-                );
+                let offsets = synthetic_bold_offsets(font_size);
+                let offsets = if synthetic_bold {
+                    &offsets[..]
+                } else {
+                    &offsets[..1]
+                };
+                let paint = anyrender::Paint::from(text_color);
+                // Every glyph uses the same union of translated fills. Drawing
+                // the whole run at each offset prevents detached accents and
+                // avoids treating precomposed multi-contour glyphs differently
+                // from the equivalent base plus combining marks.
+                for &(dx, dy) in offsets {
+                    scene.draw_glyphs(
+                        font,
+                        font_size,
+                        !FONT_EMBOLDEN_ENABLED && !synthetic_bold, // hint
+                        normalized_coords,
+                        embolden,
+                        Fill::NonZero,
+                        &paint,
+                        1.0, // alpha
+                        Affine::translate((dx, dy)) * transform,
+                        glyph_xform,
+                        glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                            id: glyph.id as _,
+                            x: glyph.x,
+                            y: glyph.y,
+                        }),
+                    );
+                }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
                 // path. The decoration is drawn once per box after the whole line has been
@@ -745,4 +811,28 @@ pub(crate) fn draw_text_selection(
         let rect = kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1);
         scene.fill(Fill::NonZero, transform, SELECTION_COLOR, None, &rect);
     });
+}
+
+#[cfg(test)]
+mod weight_synthesis_tests {
+    use super::{should_synthesize_bold, synthetic_bold_offsets};
+
+    #[test]
+    fn respects_synthesis_opt_out_and_intrinsically_bold_faces() {
+        assert!(should_synthesize_bold(true, true, false));
+        assert!(!should_synthesize_bold(true, false, false));
+        assert!(!should_synthesize_bold(true, true, true));
+        assert!(!should_synthesize_bold(false, true, false));
+    }
+
+    #[test]
+    fn emboldening_offsets_are_symmetric_and_nonzero() {
+        let offsets = synthetic_bold_offsets(24.0);
+        assert_eq!(offsets.len(), 9);
+        assert_eq!(offsets[0], (0.0, 0.0));
+        assert!(offsets.iter().skip(1).all(|&(x, y)| x != 0.0 || y != 0.0));
+        for &(x, y) in offsets.iter().skip(1) {
+            assert!(offsets.contains(&(-x, -y)));
+        }
+    }
 }
